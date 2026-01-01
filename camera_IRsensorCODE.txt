@@ -1,0 +1,280 @@
+/*
+  TRAFFIC SYSTEM - PEDESTRIAN BOTH ROADS RED (Fixed)
+  - Button (D10) long-press (3s) -> BOTH ROADS RED (D2 + D5) for PED_TIME
+  - Normal cycle: MAIN_GO -> MAIN_WARN -> MAIN_STOP (PHASE_TIME each)
+  - IR sensor (D8) detects violations during MAIN_STOP or MAIN_WARN -> buzzer (D9) + cam trigger (D11) for BUZZER_TIME
+  - Camera clock (dummy) produced on D12 via Timer2
+  - Serial at 115200
+*/
+
+#include <avr/interrupt.h>
+
+// === Pin Definitions ===
+const int mainRedPin    = 2;  // Main RED
+const int mainYellowPin = 3;  // Main YELLOW
+const int mainGreenPin  = 4;  // Main GREEN
+const int oppRedPin     = 5;  // Opp RED
+const int oppYellowPin  = 6;  // Opp YELLOW
+const int oppGreenPin   = 7;  // Opp GREEN
+
+const int irSensorPin   = 8;  // IR OUT (LOW = detected typical)
+const int buzzerPin     = 9;  // Active HIGH
+const int pedButtonPin  = 10; // Button: D10 -> GND (INPUT_PULLUP)
+const int camTriggerPin = 11; // Dummy VSYNC trigger
+const int camClockPin   = 12; // Dummy XCLK (Timer2 toggled)
+
+// === Timing ===
+const unsigned long PHASE_TIME    = 10000UL;   // 10s normal phases
+const unsigned long PED_TIME      = 10000UL;   // 10s pedestrian both roads RED (as original)
+const unsigned long BUZZER_TIME   = 3000UL;    // 3s buzzer + cam trigger
+const unsigned long PRESS_TIME    = 3000UL;    // 3s button hold
+const unsigned long IR_HOLD_TIME  = 200UL;     // 200ms stable detection
+const unsigned long BTN_DEBOUNCE  = 50UL;      // debounce ms
+
+// === States ===
+enum Phase { MAIN_GO, MAIN_WARN, MAIN_STOP, PED_MODE };
+Phase currentPhase = MAIN_STOP;
+unsigned long phaseStart = 0UL;
+
+// Button state (debounced long-press)
+int btnPrev = HIGH;
+unsigned long btnEdgeTime = 0UL;
+unsigned long btnPressStart = 0UL;
+bool btnLongCaptured = false;
+
+// IR detection state
+int lastIRState = HIGH;
+unsigned long irChangeTime = 0UL;
+bool irDetected = false;
+bool irHandled = false;
+
+// Buzzer/camera state
+bool buzzerOn = false;
+unsigned long buzzerStart = 0UL;
+
+void setup() {
+  // LEDs
+  pinMode(mainRedPin, OUTPUT);
+  pinMode(mainYellowPin, OUTPUT);
+  pinMode(mainGreenPin, OUTPUT);
+  pinMode(oppRedPin, OUTPUT);
+  pinMode(oppYellowPin, OUTPUT);
+  pinMode(oppGreenPin, OUTPUT);
+
+  // sensors, buzzer, camera trigger, button
+  pinMode(irSensorPin, INPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(camTriggerPin, OUTPUT);
+  pinMode(pedButtonPin, INPUT_PULLUP);
+
+  // initial outputs off
+  digitalWrite(buzzerPin, LOW);
+  digitalWrite(camTriggerPin, LOW);
+  digitalWrite(mainRedPin, LOW);
+  digitalWrite(mainYellowPin, LOW);
+  digitalWrite(mainGreenPin, LOW);
+  digitalWrite(oppRedPin, LOW);
+  digitalWrite(oppYellowPin, LOW);
+  digitalWrite(oppGreenPin, LOW);
+
+  Serial.begin(115200);
+  Serial.println("🚦 TRAFFIC SYSTEM STARTED (fixed)");
+  Serial.println("🔘 Hold D10 for 3s -> BOTH RED (D2 & D5) for PED_TIME");
+
+  // start dummy camera clock
+  setupCameraClock();
+
+  // start with MAIN_STOP phase
+  currentPhase = MAIN_STOP;
+  phaseStart = millis();
+  updateLights();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Phase transitions (skip automatic transitions if in PED_MODE)
+  if (currentPhase != PED_MODE) {
+    if (now - phaseStart >= PHASE_TIME) {
+      switch (currentPhase) {
+        case MAIN_GO:   changePhase(MAIN_WARN); break;
+        case MAIN_WARN: changePhase(MAIN_STOP); break;
+        case MAIN_STOP: changePhase(MAIN_GO); break;
+        default: break;
+      }
+    }
+  } else {
+    // pedestrian mode timeout
+    if (now - phaseStart >= PED_TIME) {
+      endPedestrianMode();
+    }
+  }
+
+  // Handle inputs
+  handleButton(now);
+  handleIRSensor(now);
+
+  // Buzzer / camera auto-off
+  if (buzzerOn && (now - buzzerStart >= BUZZER_TIME)) {
+    buzzerOn = false;
+    digitalWrite(buzzerPin, LOW);
+    digitalWrite(camTriggerPin, LOW); // also turn off cam trigger
+    Serial.println("🔇 Buzzer & Camera trigger OFF (timeout)");
+  }
+}
+
+// === BUTTON HANDLER (debounced long press) ===
+void handleButton(unsigned long now) {
+  int buttonState = digitalRead(pedButtonPin); // HIGH normally, LOW when pressed
+
+  if (buttonState != btnPrev) {
+    btnPrev = buttonState;
+    btnEdgeTime = now;
+  }
+
+  if (now - btnEdgeTime >= BTN_DEBOUNCE) {
+    if (buttonState == LOW) { // pressed
+      if (btnPressStart == 0) {
+        btnPressStart = now;
+        btnLongCaptured = false;
+        Serial.println("🔘 Button pressed - hold...");
+      } else {
+        if (!btnLongCaptured && (now - btnPressStart >= PRESS_TIME)) {
+          btnLongCaptured = true;
+          // Start pedestrian mode only if not already in PED_MODE
+          if (currentPhase != PED_MODE) {
+            startPedestrianMode();
+          } else {
+            Serial.println("Pedestrian mode already active");
+          }
+        }
+      }
+    } else { // released
+      if (btnPressStart != 0 && !btnLongCaptured) {
+        Serial.println("🔘 Button released too soon");
+      }
+      btnPressStart = 0;
+      btnLongCaptured = false;
+    }
+  }
+}
+
+// === Start pedestrian mode ===
+void startPedestrianMode() {
+  currentPhase = PED_MODE;
+  phaseStart = millis(); // pedestrian window start
+  // both roads RED
+  digitalWrite(mainRedPin, HIGH);
+  digitalWrite(mainYellowPin, LOW);
+  digitalWrite(mainGreenPin, LOW);
+  digitalWrite(oppRedPin, HIGH);
+  digitalWrite(oppYellowPin, LOW);
+  digitalWrite(oppGreenPin, LOW);
+
+  // reset IR gating so new violations OK after this phase ends
+  irHandled = false;
+  irDetected = false;
+
+  Serial.println("🚶 PEDESTRIAN MODE ACTIVATED (BOTH RED)");
+}
+
+// === End pedestrian mode: return to MAIN_STOP and resume cycle ===
+void endPedestrianMode() {
+  Serial.println("🔄 Pedestrian period ended - resuming cycle");
+  changePhase(MAIN_STOP);
+}
+
+// === IR SENSOR HANDLER ===
+void handleIRSensor(unsigned long now) {
+  int irState = digitalRead(irSensorPin); // typical: LOW = detected
+
+  if (irState != lastIRState) {
+    lastIRState = irState;
+    irChangeTime = now;
+    irDetected = false;
+  }
+
+  // stable detection
+  if (irState == LOW && !irDetected && (now - irChangeTime >= IR_HOLD_TIME)) {
+    irDetected = true;
+    // allow violation only during MAIN_STOP (main red) or MAIN_WARN (main yellow)
+    if (!irHandled && (currentPhase == MAIN_STOP || currentPhase == MAIN_WARN)) {
+      triggerViolation();
+    }
+  }
+
+  // reset handled when clear
+  if (irState == HIGH && irHandled) {
+    irHandled = false;
+    irDetected = false;
+  }
+}
+
+void triggerViolation() {
+  buzzerOn = true;
+  buzzerStart = millis();
+  digitalWrite(buzzerPin, HIGH);
+  digitalWrite(camTriggerPin, HIGH); // camera VSYNC dummy HIGH
+  irHandled = true;
+  Serial.println("🚨 VIOLATION! Buzzer & Camera triggered for 3s");
+}
+
+// === PHASE MANAGEMENT ===
+void changePhase(Phase newPhase) {
+  currentPhase = newPhase;
+  phaseStart = millis();
+  updateLights();
+
+  // Reset IR gating
+  irHandled = false;
+  irDetected = false;
+
+  Serial.print("🔄 Phase: ");
+  switch (newPhase) {
+    case MAIN_GO:   Serial.println("MAIN GREEN + OPPOSITE RED"); break;
+    case MAIN_WARN: Serial.println("MAIN YELLOW + OPPOSITE YELLOW"); break;
+    case MAIN_STOP: Serial.println("MAIN RED + OPPOSITE GREEN"); break;
+    case PED_MODE:  Serial.println("PEDESTRIAN ACTIVE (BOTH RED)"); break;
+  }
+}
+
+void updateLights() {
+  // turn all off first
+  digitalWrite(mainRedPin, LOW);
+  digitalWrite(mainYellowPin, LOW);
+  digitalWrite(mainGreenPin, LOW);
+  digitalWrite(oppRedPin, LOW);
+  digitalWrite(oppYellowPin, LOW);
+  digitalWrite(oppGreenPin, LOW);
+
+  // set based on currentPhase (PED_MODE handled separately where started)
+  if (currentPhase == MAIN_GO) {
+    digitalWrite(mainGreenPin, HIGH);
+    digitalWrite(oppRedPin, HIGH);
+  } else if (currentPhase == MAIN_WARN) {
+    digitalWrite(mainYellowPin, HIGH);
+    digitalWrite(oppYellowPin, HIGH);
+  } else if (currentPhase == MAIN_STOP) {
+    digitalWrite(mainRedPin, HIGH);
+    digitalWrite(oppGreenPin, HIGH);
+  } else if (currentPhase == PED_MODE) {
+    digitalWrite(mainRedPin, HIGH);
+    digitalWrite(oppRedPin, HIGH);
+  }
+}
+
+// === CAMERA CLOCK ===
+void setupCameraClock() {
+  pinMode(camClockPin, OUTPUT);
+  cli();
+  TCCR2A = 0; TCCR2B = 0; TCNT2 = 0;
+  OCR2A = 127;
+  TCCR2A |= (1 << WGM21);
+  TCCR2B |= (1 << CS20);
+  TIMSK2 |= (1 << OCIE2A);
+  sei();
+}
+
+ISR(TIMER2_COMPA_vect) {
+  PINB = _BV(PB4); // toggle PB4 (digital 12)
+}
